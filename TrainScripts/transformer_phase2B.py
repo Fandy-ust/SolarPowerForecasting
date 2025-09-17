@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
 import os
@@ -10,6 +10,18 @@ import math
 import warnings
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Import shared utilities
+from utils import (
+    PositionalEncoding, TimeSeriesTransformer, SolarPowerDataset_Transformer,
+    masked_rmse, find_continuous_segments, apply_zscore_scaling, scale_dataframe_by_campus,
+    process_batch, autoregressive_generate, create_dataloaders,
+    TARGET_COLUMN, WEATHER_FEATURES, TIME_FEATURES, ENCODER_FEATURES,
+    FUTURE_KNOWN_FEATURES, DECODER_INPUT_FEATURES, get_target_feature_index,
+    LOOKBACK_STEPS, LOOKFORWARD_STEPS, BATCH_SIZE, MAX_GRAD_NORM, 
+    PATIENCE, SENTINEL_VALUE, D_MODEL, NHEAD, NUM_ENCODER_LAYERS, 
+    NUM_DECODER_LAYERS, DIM_FEEDFORWARD, DROPOUT_RATE
+)
 
 # --- Basic Configuration ---
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -33,10 +45,7 @@ TARGET_COLUMN = 'SolarGeneration'
 WEATHER_FEATURES = ['AirTemperature', 'Ghi_hourly', 'CloudOpacity_hourly', "minutes_since_last_update",
                     "RelativeHumidity"]
 TIME_FEATURES = ["zenith_sin", "azimuth_sin", "day_sin", "year_sin"]
-ENCODER_FEATURES = WEATHER_FEATURES + TIME_FEATURES + [TARGET_COLUMN]
-FUTURE_KNOWN_FEATURES = TIME_FEATURES
-DECODER_INPUT_FEATURES = FUTURE_KNOWN_FEATURES + [TARGET_COLUMN]
-TARGET_FEATURE_INDEX = DECODER_INPUT_FEATURES.index(TARGET_COLUMN)
+# Feature definitions now imported from utils
 
 # --- Training Hyperparameters ---
 LOOKBACK_STEPS = 4 * 24
@@ -58,167 +67,11 @@ DIM_FEEDFORWARD = 512
 DROPOUT_RATE = 0.1
 
 
-# =============================================================================
-#  2. Reusable Modules (Model, Dataset, Scaling - Unchanged)
-# =============================================================================
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
 
 
-class TimeSeriesTransformer(nn.Module):
-    def __init__(self, encoder_feature_dim: int, decoder_feature_dim: int, d_model: int, nhead: int,
-                 num_encoder_layers: int, num_decoder_layers: int, dim_feedforward: int, dropout: float):
-        super().__init__()
-        self.d_model = d_model
-        self.encoder_embedding = nn.Linear(encoder_feature_dim, d_model)
-        self.decoder_embedding = nn.Linear(decoder_feature_dim, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-        self.transformer = nn.Transformer(
-            d_model=d_model, nhead=nhead, num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers, dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True
-        )
-        self.output_layer = nn.Linear(d_model, 1)
-
-    def _generate_square_subsequent_mask(self, sz: int) -> torch.Tensor:
-        return torch.triu(torch.ones(sz, sz) * float('-inf'), diagonal=1)
-
-    def forward(self, src: torch.Tensor, tgt: torch.Tensor,
-                tgt_key_padding_mask: torch.Tensor,
-                src_key_padding_mask: torch.Tensor) -> torch.Tensor:
-        tgt_mask = self._generate_square_subsequent_mask(tgt.size(1)).to(src.device)
-        src_emb = self.encoder_embedding(src) * math.sqrt(self.d_model)
-        src_emb = self.pos_encoder(src_emb)
-        tgt_emb = self.decoder_embedding(tgt) * math.sqrt(self.d_model)
-        tgt_emb = self.pos_encoder(tgt_emb)
-        memory = self.transformer.encoder(
-            src=src_emb,
-            src_key_padding_mask=src_key_padding_mask
-        )
-        decoder_output = self.transformer.decoder(
-            tgt=tgt_emb,
-            memory=memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=src_key_padding_mask,
-        )
-        return self.output_layer(decoder_output)
 
 
-class SolarPowerDataset_Transformer(Dataset):
-    def __init__(self, df, lookback, lookforward):
-        self.df = df
-        self.lookback = lookback
-        self.lookforward = lookforward
-        self.total_seq_len = lookback + lookforward
-        self.campus_indices = []
-        for campus_id in df['CampusKey'].unique():
-            campus_df = df[df['CampusKey'] == campus_id]
-            start_index = campus_df.index[0]
-            num_samples = len(campus_df) - self.total_seq_len + 1
-            if num_samples > 0:
-                self.campus_indices.append({'start': start_index, 'count': num_samples})
-        self.total_samples = sum(c['count'] for c in self.campus_indices)
 
-    def __len__(self):
-        return self.total_samples
-
-    def __getitem__(self, idx):
-        campus_idx = 0
-        while idx >= self.campus_indices[campus_idx]['count']:
-            idx -= self.campus_indices[campus_idx]['count']
-            campus_idx += 1
-        start_pos = self.campus_indices[campus_idx]['start'] + idx
-        end_pos = start_pos + self.total_seq_len
-        sequence_slice = self.df.iloc[start_pos:end_pos]
-
-        src_df = sequence_slice.iloc[:self.lookback].copy()
-        src_key_padding_mask = torch.tensor(src_df[TARGET_COLUMN].isna().values, dtype=torch.bool)
-        src_df.fillna(0, inplace=True)
-        src = torch.tensor(src_df[ENCODER_FEATURES].values, dtype=torch.float32)
-
-        future_slice = sequence_slice.iloc[self.lookback:]
-        tgt_key_padding_mask = torch.tensor(future_slice[TARGET_COLUMN].isna().values, dtype=torch.bool)
-
-        last_obs = sequence_slice.iloc[self.lookback - 1][TARGET_COLUMN]
-        shifted = future_slice[TARGET_COLUMN].shift(1)
-        shifted.iloc[0] = last_obs
-        shifted = shifted.fillna(0)
-        future_known_df = future_slice[FUTURE_KNOWN_FEATURES]
-        tgt_input_df = pd.concat([future_known_df.reset_index(drop=True),
-                                  shifted.reset_index(drop=True).rename(TARGET_COLUMN)], axis=1)
-        tgt_input = torch.tensor(tgt_input_df[DECODER_INPUT_FEATURES].values, dtype=torch.float32)
-
-        tgt_output_series = future_slice[TARGET_COLUMN].fillna(SENTINEL_VALUE)
-        tgt_output = torch.tensor(tgt_output_series.values, dtype=torch.float32).unsqueeze(-1)
-
-        return src, tgt_input, tgt_output, tgt_key_padding_mask, src_key_padding_mask
-
-
-def apply_zscore_scaling(df_data, columns, stats):
-    df_scaled = df_data.copy()
-    for col in columns:
-        if col in stats and stats[col]['std'] > 1e-6:
-            df_scaled[col] = (df_scaled[col] - stats[col]['mean']) / stats[col]['std']
-    return df_scaled
-
-
-def scale_dataframe_by_campus(df, scaler_stats):
-    if df.empty: return pd.DataFrame()
-    scaled_dfs = []
-    columns_to_scale = WEATHER_FEATURES + [TARGET_COLUMN]
-    for campus_id_num, group in df.groupby('CampusKey'):
-        group_copy = group.copy()
-        campus_id = str(campus_id_num)
-        campus_params = scaler_stats.get(campus_id)
-        if campus_params:
-            for col in WEATHER_FEATURES:
-                if col in group_copy.columns:
-                    group_copy[col] = group_copy[col].fillna(0)
-            scaled_group = apply_zscore_scaling(group_copy, columns_to_scale, campus_params)
-            scaled_dfs.append(scaled_group)
-    if not scaled_dfs: return pd.DataFrame()
-    return pd.concat(scaled_dfs).sort_index()
-
-
-# =============================================================================
-#  3. Helper Functions for Phase 2B (Unchanged)
-# =============================================================================
-def masked_rmse(pred, target, pad_mask):
-    valid_positions = ~pad_mask.squeeze(-1)
-    if not valid_positions.any():
-        return torch.tensor(0.0)
-    error = (pred - target)[valid_positions]
-    return torch.sqrt(torch.mean(error ** 2))
-
-
-def find_continuous_segments(mask, min_length=3):
-    continuity_mask = torch.zeros_like(mask)
-    for b in range(mask.size(0)):
-        kernel = torch.ones(min_length, device=mask.device)
-        padded_seq = F.pad(mask[b].float(), (min_length - 1, 0))
-        conv_res = F.conv1d(padded_seq.view(1, 1, -1), kernel.view(1, 1, -1)).squeeze()
-        is_in_segment = conv_res >= min_length
-        for i in torch.where(is_in_segment)[0]:
-            continuity_mask[b, i:i + min_length] = True
-    return continuity_mask & mask
-
-
-# =============================================================================
-#  4. Core Logic: The SolarTransformerPhase2B Class (Refactored)
-# =============================================================================
 # =============================================================================
 #  4. Core Logic: The SolarTransformerPhase2B Class (CORRECTED)
 # =============================================================================
@@ -228,11 +81,7 @@ class SolarTransformerPhase2B:
         self.optimizer = optimizer
 
     def process_batch(self, batch):
-        src, tgt_in, tgt_out, tgt_mask, src_mask = batch
-        return (
-            src.to(DEVICE), tgt_in.to(DEVICE), tgt_out.to(DEVICE),
-            tgt_mask.to(DEVICE), src_mask.to(DEVICE)
-        )
+        return process_batch(batch, DEVICE)
 
     def train_epoch(self, loader, epoch, prediction_cache):
         self.model.train()
@@ -269,11 +118,14 @@ class SolarTransformerPhase2B:
             # Combine the masks: apply SS only where we have ground truth
             final_ss_mask = ss_mask & ground_truth_mask
 
+            # Get target feature index from utils
+            target_idx = get_target_feature_index()
+
             # 1. Fill NaNs using the cached predictions (always)
-            mixed_input[:, :, TARGET_FEATURE_INDEX][nan_mask] = cached_preds[nan_mask]
+            mixed_input[:, :, target_idx][nan_mask] = cached_preds[nan_mask]
 
             # 2. Apply scheduled sampling to the ground-truth values
-            mixed_input[:, :, TARGET_FEATURE_INDEX][final_ss_mask] = cached_preds[final_ss_mask]
+            mixed_input[:, :, target_idx][final_ss_mask] = cached_preds[final_ss_mask]
 
             # Core training step
             self.optimizer.zero_grad()
@@ -324,43 +176,9 @@ class SolarTransformerPhase2B:
     def incremental_fill(self, src, src_mask, tgt_in, tgt_mask):
         """
         CORRECTED AND ROBUST: Fills NaNs autoregressively and returns the full predicted sequence.
-        This version explicitly builds the output tensor step-by-step to guarantee correct shape.
+        Uses the shared autoregressive_generate function from utils.
         """
-        self.model.eval()
-        with torch.no_grad():
-            # The input used by the model in each loop, starts as the ground-truth
-            working_input = tgt_in.clone()
-
-            # The final output tensor we will return, initialized to zeros.
-            # Its shape is guaranteed to be [B, 20, 1] from the start.
-            final_predictions = torch.zeros_like(tgt_in[:, :, 0]).unsqueeze(-1)
-
-            # Iterate through each of the 20 timesteps to generate the forecast
-            for step in range(LOOKFORWARD_STEPS):
-                # Get a prediction for the current state of the input sequence.
-                # The model predicts all 20 steps, but we only trust the immediate next one.
-                pred_all_steps = self.model(
-                    src,
-                    working_input,
-                    tgt_key_padding_mask=tgt_mask,
-                    src_key_padding_mask=src_mask
-                )
-
-                # Get the single prediction for the current step from the model's output
-                pred_this_step = pred_all_steps[:, step, 0]
-
-                # Store this reliable prediction in our final output tensor
-                final_predictions[:, step, 0] = pred_this_step
-
-                # For the next loop, update the *next* step in the input tensor
-                # This is the autoregressive part.
-                if step < LOOKFORWARD_STEPS - 1:
-                    # Update the input for the next iteration using the prediction we just made.
-                    # This only affects the input for the *next* loop, not the `final_predictions` tensor.
-                    working_input[:, step + 1, TARGET_FEATURE_INDEX] = pred_this_step
-
-        # Return the safely constructed predictions, which is guaranteed to have the correct shape.
-        return final_predictions
+        return autoregressive_generate(self.model, src, src_mask, tgt_in, tgt_mask, DEVICE)
 
     def continuous_aware_loss(self, pred, target, mask, epoch):
         """Adaptive loss focusing more on continuous segments over time."""
@@ -430,9 +248,6 @@ class SolarTransformerPhase2B:
 
 
 # =============================================================================
-#  5. Main Execution Logic for Phase 2B (Refactored)
-# =============================================================================
-# =============================================================================
 #  5. Main Execution Logic for Phase 2B (with new saving strategy)
 # =============================================================================
 if __name__ == "__main__":
@@ -446,14 +261,8 @@ if __name__ == "__main__":
     with open(STATS_FILE_PATH, 'r') as f:
         scaling_stats = json.load(f)
 
-    df_train_scaled = scale_dataframe_by_campus(df_train_all, scaling_stats)
-    df_val_scaled = scale_dataframe_by_campus(df_val_all, scaling_stats)
-
-    train_dataset = SolarPowerDataset_Transformer(df_train_scaled, LOOKBACK_STEPS, LOOKFORWARD_STEPS)
-    val_dataset = SolarPowerDataset_Transformer(df_val_scaled, LOOKBACK_STEPS, LOOKFORWARD_STEPS)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
-    print(f"Train samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    train_loader, val_loader = create_dataloaders(df_train_all, df_val_all, scaling_stats, BATCH_SIZE)
+    print(f"Train samples: {len(train_loader.dataset)}, Validation samples: {len(val_loader.dataset)}")
 
     # 2. Initialize model and load Phase 2A weights
     model = TimeSeriesTransformer(

@@ -18,11 +18,11 @@ This project is not just a demonstration of a powerful architecture, but a case 
 
 The project's success is best illustrated by the iterative improvement across the final training phases. The key was moving from a powerful but naive model (V4) to a hardened, aggressively fine-tuned final model (V6).
 
-| Model Version | Strategy                             | Test Set R² | Test Set RMSE (kW) |
-| :------------ | :----------------------------------- | :---------- | :----------------- |
-| **V4**        | Elite Baseline (Pre-Polish)          | 0.8731      | \~1.95             |
-| **V5**        | Standard Autoregressive Polish       | 0.8779      | 1.798              |
-| **V6**        | **Aggressive Autoregressive Polish** | **0.9008**  | **1.621**          |
+| Model Version | Strategy                             | Test Set R² | Test Set RMSE (kW) | Training Phase |
+| :------------ | :----------------------------------- | :---------- | :----------------- | :------------- |
+| **V4**        | Elite Baseline (Post Phase 2B)      | 0.8731      | \~1.95             | After Phase 2B |
+| **V5**        | Small LR Autoregressive Polish      | 0.8779      | 1.798              | Phase 3 (LR=1e-5) |
+| **V6**        | **Aggressive Autoregressive Polish** | **0.9008**  | **1.621**          | Phase 3 Final |
 
 
 
@@ -65,9 +65,9 @@ These features enhanced the model's ability to predict accurately over 6-hour ho
 
 In this project, I developed a Transformer-based model for solar power forecasting. Below, I'll walk you through the key phases of development, highlighting the challenges, innovations, and improvements along the way. Each phase built on the last, tackling issues like exposure bias and over-regularization to achieve a final R² score of **0.9008**.
 
-#### Phase 1 & 2: Establishing a Strong Baseline (Model V4)
+#### Phase 1, 2A & 2B: Establishing a Strong Baseline (Model V4)
 
-The early stages focused on creating a robust Transformer model using proven techniques like **teacher forcing** (feeding the model the correct answers during training) and **scheduled sampling** (gradually introducing the model's own predictions).
+The early stages focused on creating a robust Transformer model using proven techniques like **teacher forcing** (feeding the model the correct answers during training) and **scheduled sampling** (gradually introducing the model's own predictions). Phase 2B completes the initial training regimen, producing Model V4.
 
 Here's how it worked:
 - **Handling missing values**: For sequences with gaps (e.g., [t0, t1, NaN, NaN, t4, t5]), the model autoregressively fills them in. It predicts `t2` using t0 and t1 as input, then uses that prediction to forecast `t3`, and so on.
@@ -78,10 +78,10 @@ This approach yielded a solid R² score of **0.873**. However, it had a key limi
 
 #### Phase 3: Eliminating Exposure Bias with Autoregressive Fine-Tuning (Model V5)
 
-To address exposure bias, I fine-tuned the model in a **fully autoregressive** setup—like removing the training wheels. Now, the model relied entirely on its own previous predictions as input for the next steps.
+To address exposure bias, I fine-tuned the model in a **fully autoregressive** setup—like removing the training wheels. Phase 3 uses a small learning rate (1e-5) to carefully polish the model through autoregressive training, where the model relies entirely on its own previous predictions as input for the next steps.
 
-- **Why this matters**: This "hardening" process taught the model to self-correct and stay stable over long forecast horizons (e.g., predicting 6 hours ahead).
-- **Results**: The R² improved to **0.878**, showing better resilience to accumulated errors.
+- **Why this matters**: This "hardening" process with careful learning rate adjustment taught the model to self-correct and stay stable over long forecast horizons (e.g., predicting 6 hours ahead).
+- **Results**: The R² improved to **0.878** (Model V5), showing better resilience to accumulated errors through the small learning rate fine-tuning approach.
 
 #### The Final Push: Unleashing Full Potential (Model V6)
 

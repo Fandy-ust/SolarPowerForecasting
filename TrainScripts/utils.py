@@ -242,6 +242,47 @@ def masked_mse_loss(predictions: torch.Tensor, targets: torch.Tensor, sentinel_v
     return F.mse_loss(predictions_masked, targets_masked)
 
 
+def masked_rmse(pred, target, pad_mask):
+    """
+    Calculate RMSE while ignoring padded/masked positions.
+    
+    Args:
+        pred: Model predictions
+        target: Ground truth targets
+        pad_mask: Boolean mask indicating padded positions
+    
+    Returns:
+        RMSE loss computed only on non-padded values
+    """
+    valid_positions = ~pad_mask.squeeze(-1)
+    if not valid_positions.any():
+        return torch.tensor(0.0)
+    error = (pred - target)[valid_positions]
+    return torch.sqrt(torch.mean(error ** 2))
+
+
+def find_continuous_segments(mask, min_length=3):
+    """
+    Find continuous segments of valid data in a boolean mask.
+    
+    Args:
+        mask: Boolean tensor [batch_size, seq_len] indicating valid positions
+        min_length: Minimum length of continuous segments to identify
+    
+    Returns:
+        Boolean tensor indicating positions that are part of continuous segments
+    """
+    continuity_mask = torch.zeros_like(mask)
+    for b in range(mask.size(0)):
+        kernel = torch.ones(min_length, device=mask.device)
+        padded_seq = F.pad(mask[b].float(), (min_length - 1, 0))
+        conv_res = F.conv1d(padded_seq.view(1, 1, -1), kernel.view(1, 1, -1)).squeeze()
+        is_in_segment = conv_res >= min_length
+        for i in torch.where(is_in_segment)[0]:
+            continuity_mask[b, i:i + min_length] = True
+    return continuity_mask & mask
+
+
 # =============================================================================
 # DATA PREPROCESSING UTILITIES
 # =============================================================================
@@ -343,3 +384,116 @@ def create_model(encoder_feature_dim=None, decoder_feature_dim=None, device=None
     ).to(device)
     
     return model
+
+
+def process_batch(batch, device):
+    """
+    Move batch tensors to specified device.
+    
+    Args:
+        batch: Tuple of tensors (src, tgt_in, tgt_out, tgt_mask, src_mask)
+        device: Target device
+    
+    Returns:
+        Tuple of tensors moved to device
+    """
+    src, tgt_in, tgt_out, tgt_mask, src_mask = batch
+    return (
+        src.to(device), 
+        tgt_in.to(device), 
+        tgt_out.to(device),
+        tgt_mask.to(device), 
+        src_mask.to(device)
+    )
+
+
+def autoregressive_generate(model, src, src_mask, tgt_initial, tgt_mask, device, lookforward_steps=None):
+    """
+    Generate predictions autoregressively step by step.
+    
+    Args:
+        model: Trained transformer model
+        src: Source sequence tensor
+        src_mask: Source padding mask
+        tgt_initial: Initial target sequence
+        tgt_mask: Target padding mask
+        device: Device to run on
+        lookforward_steps: Number of steps to generate (default: LOOKFORWARD_STEPS)
+    
+    Returns:
+        Generated predictions tensor
+    """
+    if lookforward_steps is None:
+        lookforward_steps = LOOKFORWARD_STEPS
+    
+    model.eval()
+    with torch.no_grad():
+        working_input = tgt_initial.clone()
+        target_feature_index = get_target_feature_index()
+        
+        # Initialize output tensor with correct shape
+        final_predictions = torch.zeros_like(tgt_initial[:, :, 0]).unsqueeze(-1)
+        
+        # Generate predictions step by step
+        for step in range(lookforward_steps):
+            pred_all_steps = model(
+                src,
+                working_input,
+                tgt_key_padding_mask=tgt_mask,
+                src_key_padding_mask=src_mask
+            )
+            
+            # Get prediction for current step
+            pred_this_step = pred_all_steps[:, step, 0]
+            final_predictions[:, step, 0] = pred_this_step
+            
+            # Update input for next iteration (autoregressive feedback)
+            if step < lookforward_steps - 1:
+                working_input[:, step + 1, target_feature_index] = pred_this_step
+        
+        return final_predictions
+
+
+def create_dataloaders(train_df, val_df, scaler_stats, batch_size=None, num_workers=0):
+    """
+    Create train and validation DataLoaders with proper scaling.
+    
+    Args:
+        train_df: Training DataFrame
+        val_df: Validation DataFrame
+        scaler_stats: Scaling statistics dictionary
+        batch_size: Batch size (default: BATCH_SIZE)
+        num_workers: Number of worker processes
+    
+    Returns:
+        Tuple of (train_loader, val_loader)
+    """
+    if batch_size is None:
+        batch_size = BATCH_SIZE
+    
+    # Scale dataframes
+    train_scaled = scale_dataframe_by_campus(train_df, scaler_stats)
+    val_scaled = scale_dataframe_by_campus(val_df, scaler_stats)
+    
+    # Create datasets
+    train_dataset = SolarPowerDataset_Transformer(train_scaled, LOOKBACK_STEPS, LOOKFORWARD_STEPS)
+    val_dataset = SolarPowerDataset_Transformer(val_scaled, LOOKBACK_STEPS, LOOKFORWARD_STEPS)
+    
+    # Create DataLoaders
+    from torch.utils.data import DataLoader
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers, 
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
